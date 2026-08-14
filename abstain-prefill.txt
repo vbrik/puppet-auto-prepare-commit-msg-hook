@@ -9,3 +9,4 @@
 # heuristic gap rather than a live regression (strict xfail: turns into a
 # hard failure again once the heuristic actually gets fixed).
 f210d2479d2e1c9ab95e0f0d0b2a3ce8c46d1732  # xfail: multi-concern commit (doc tweak, new experimental module, site.pp node change); hook picks "modulejail" via multi_class_prefix instead of abstaining
+9ffa9d29e870b40cff5a2d7786f61f6ce73b387e
