@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""
+Git prepare-commit-msg hook that automatically generates a commit subject
+prefix following IceCube's Puppet repository conventions. The prefix encodes
+the scope of the change (e.g. a Puppet class name, node hostname, or file
+path) and is prepended to the commit message as "<SCOPE> --- ".
+
+The scope is derived from the staged diff: Puppet class/define/node
+declarations are extracted from hunk headers, changed lines, and surrounding
+context; non-manifest files are mapped to a scope based on their path.
+
+Hook mode (called by git):
+    prepare-commit-msg <commit-msg-file> [<source> [<sha>]]
+    Skipped for amend/merge/squash/-m commits.
+    No prefix is added when the scope cannot be determined.
+
+Testing mode (no arguments):
+    Reads a git diff from stdin, writes the scope prefix to stdout.
+    Exits with status 1 if the scope cannot be determined.
+"""
+
+import argparse
+import dataclasses
+import enum
+import functools
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, NamedTuple
+
+DOMAIN_SUFFIX = '.icecube.wisc.edu'
+
+
+class Outcome(str, enum.Enum):
+    CHOSEN    = 'chosen'
+    SKIPPED   = 'skipped'
+    NO_RESULT = 'no_result'
+    INFO      = 'info'
+
+
+@dataclasses.dataclass
+class TraceSignals:
+    files: list[str]
+    class_added: list[str]
+    class_removed: list[str]
+    class_hunk: list[str]
+    class_candidates: list[str]
+    class_source: str
+    node_added: list[str]
+    node_removed: list[str]
+    node_hunk: list[str]
+    node_hunk_pre: list[str]
+    node_candidates: list[str]
+    node_source: str
+
+
+@dataclasses.dataclass
+class TraceStepDetails:
+    reason: str | None = None
+    file: str | None = None
+    candidates: list[str] | None = None
+    branch: str | None = None
+    pp_files: list[str] | None = None
+    non_pp_files: list[str] | None = None
+    module: str | None = None
+    hunk_classes: list[str] | None = None
+    modules: list[str] | None = None
+    scoped: list[str] | None = None
+
+
+@dataclasses.dataclass
+class TraceStep:
+    step: str
+    outcome: Outcome
+    value: str | None = None
+    details: TraceStepDetails | None = None
+
+
+@dataclasses.dataclass
+class Trace:
+    signals: TraceSignals | None = None
+    steps: list[TraceStep] = dataclasses.field(default_factory=list)
+    scope: str | None = None
+
+
+@functools.lru_cache(maxsize=1)
+def _load_module_dirs() -> frozenset[str]:
+    conf = Path(__file__).resolve().parent.parent / 'environment.conf'
+    for line in conf.read_text(encoding='utf-8').splitlines():
+        key, _, value = line.partition('=')
+        if key.strip() == 'modulepath':
+            return frozenset(
+                entry.strip().removeprefix('./')
+                for entry in value.split(':')
+                if entry.strip() and not entry.strip().startswith('$')
+            )
+    raise ValueError(f'modulepath not found in {conf}')
+
+
+@functools.lru_cache(maxsize=1)
+def _module_re() -> str:
+    return '(?:' + '|'.join(sorted(_load_module_dirs())) + ')'
+
+
+class HunkInfo(NamedTuple):
+    filepath: str
+    header_ctx: str          # text after @@ ... @@ on the hunk header line
+    pre_change_lines: list[str]  # context lines before the first +/- in this hunk
+
+
+class DiffLine(NamedTuple):
+    filepath: str
+    content: str
+
+
+class DiffResult(NamedTuple):
+    files: list[str]
+    hunks: list[HunkInfo]
+    added_lines: list[DiffLine]
+    removed_lines: list[DiffLine]
+
+
+def parse_diff(text: str) -> DiffResult:
+    files: list[str] = []
+    hunks: list[HunkInfo] = []
+    added_lines: list[DiffLine] = []
+    removed_lines: list[DiffLine] = []
+    current_file: str | None = None
+    current_hunk: HunkInfo | None = None
+    hunk_seen_change = False
+
+    for line in text.splitlines():
+        if line.startswith('diff --git '):
+            m = re.match(r'^diff --git a/.+ b/(.+)$', line)
+            if m:
+                current_file = m.group(1)
+                if current_file not in files:
+                    files.append(current_file)
+            current_hunk = None
+        elif line.startswith('@@ ') and current_file:
+            m = re.match(r'^@@ [^@]+ @@ (.+)$', line)
+            ctx = m.group(1).strip() if m else ''
+            current_hunk = HunkInfo(current_file, ctx, [])
+            hunks.append(current_hunk)
+            hunk_seen_change = False
+        elif current_hunk is not None:
+            if line.startswith('+') and not line.startswith('+++'):
+                added_lines.append(DiffLine(current_hunk.filepath, line[1:]))
+                hunk_seen_change = True
+            elif line.startswith('-') and not line.startswith('---'):
+                removed_lines.append(DiffLine(current_hunk.filepath, line[1:]))
+                hunk_seen_change = True
+            elif line.startswith(' ') and not hunk_seen_change:
+                current_hunk.pre_change_lines.append(line[1:])
+
+    return DiffResult(files, hunks, added_lines, removed_lines)
+
+
+class EntityKind(str, enum.Enum):
+    CLASS = 'class'
+    NODE  = 'node'
+
+
+class PuppetEntity(NamedTuple):
+    kind: EntityKind
+    name: str
+
+
+def _regex_node_name(pattern: str) -> str:
+    """Strip ^ / $ anchors from a regex node pattern, keeping the rest."""
+    return pattern.lstrip('^').rstrip('$')
+
+
+def _parse_node_name(s: str) -> str | None:
+    """Extract node name from a string that starts with 'node' (no leading whitespace)."""
+    m = re.match(r"^node\s+['\"]([^'\"]+)['\"]", s)
+    if m:
+        return m.group(1).replace(DOMAIN_SUFFIX, '')
+    m = re.match(r'^node\s+/([^/]+)/', s)
+    if m:
+        return _regex_node_name(m.group(1))
+    # Bare-word node name — old Puppet 3 syntax; supported for testing on old diffs.
+    m = re.match(r'^node\s+(\w[\w.-]*)[\s{]', s)
+    if m:
+        return m.group(1).replace(DOMAIN_SUFFIX, '')
+    return None
+
+
+def puppet_entity_from_context(ctx: str) -> PuppetEntity | None:
+    """Extract a PuppetEntity from a hunk header context string, or None."""
+    m = re.match(r'^(?:class|define)\s+([\w:]+)', ctx)
+    if m:
+        return PuppetEntity(EntityKind.CLASS, m.group(1))
+    name = _parse_node_name(ctx)
+    if name is not None:
+        return PuppetEntity(EntityKind.NODE, name)
+    return None
+
+
+def puppet_entity_from_line(line: str) -> str | None:
+    """Extract a class/define name if the line IS a class/define declaration.
+
+    Only matches low-indentation (≤4 spaces) to avoid catching class references
+    embedded inside other blocks (e.g. class{'foo':}).
+    """
+    m = re.match(r'^\s{0,4}(?:class|define)\s+([\w:]+)[\s({]', line)
+    if m:
+        return m.group(1)
+    # Handle no-argument defines/classes with nothing after name
+    m = re.match(r'^\s{0,4}(?:class|define)\s+([\w:]+)\s*$', line)
+    if m:
+        return m.group(1)
+    return None
+
+
+def puppet_node_from_line(line: str) -> str | None:
+    """Extract hostname/name if the line IS a node declaration (≤4 leading spaces)."""
+    if not re.match(r'^\s{0,4}node\s', line):
+        return None
+    return _parse_node_name(line.lstrip())
+
+
+def path_to_scope(filepath: str) -> str:
+    """Convert a non-manifest file path to a scope string."""
+    # <module-type-dir>/<module>/{files,templates}/[subdirs/]<filename>
+    m = re.match(rf'^{_module_re()}/([^/]+)/(?:files|templates)/(.+)$', filepath)
+    if m:
+        basename = m.group(2).rsplit('/', 1)[-1]
+        return f'{m.group(1)}/{basename}'
+
+    # hiera/*.yaml -> just filename
+    m = re.match(r'^hiera/(.+)$', filepath)
+    if m:
+        return m.group(1)
+
+    # hostfiles/<path> -> keep hostfiles/ prefix
+    m = re.match(r'^hostfiles/(.+)$', filepath)
+    if m:
+        return f'hostfiles/{m.group(1)}'
+
+    return filepath
+
+
+def first_nonempty(*lists: list[str]) -> list[str]:
+    return next((lst for lst in lists if lst), [])
+
+
+def common_prefix(names: list[str], sep: str) -> str | None:
+    """Longest common prefix across all names when split by sep."""
+    if not names:
+        return None
+    if len(names) == 1:
+        return next(iter(names))
+    parts = [n.split(sep) for n in names]
+    common = parts[0]
+    for p in parts[1:]:
+        common = [a for a, b in zip(common, p) if a == b]
+    return sep.join(common) if common else None
+
+
+def specificity(name: str) -> int:
+    """Number of :: segments — more segments = more specific."""
+    return name.count('::')
+
+
+def manifest_path_to_scope(filepath: str) -> str | None:
+    """Derive Puppet class name from a manifest file path as a last resort."""
+    m = re.match(rf'^{_module_re()}/([^/]+)/manifests/init\.pp$', filepath)
+    if m:
+        return m.group(1)
+    m = re.match(rf'^{_module_re()}/([^/]+)/manifests/([^/]+)\.pp$', filepath)
+    if m:
+        return f'{m.group(1)}::{m.group(2)}'
+    return None
+
+
+def _module_of(filepath: str) -> str | None:
+    """Return the module name for a path under a module dir, or None."""
+    m = re.match(rf'^{_module_re()}/([^/]+)/', filepath)
+    return m.group(1) if m else None
+
+
+class EntitySignals(NamedTuple):
+    all_class_candidates: list[str]  # first non-empty source wins; others suppressed
+    all_node_candidates: list[str]   # same shadowing priority
+    hunk_classes: list[str]          # best per-hunk class signal, for module cross-check
+
+
+def _hunk_entity(hunk: HunkInfo) -> PuppetEntity | None:
+    """Return the PuppetEntity best associated with this hunk, or None.
+
+    Pre-change context lines take precedence over the @@ header: the header often
+    shows a preceding sibling declaration rather than the actual enclosing block.
+    """
+    for line in hunk.pre_change_lines:
+        name = puppet_entity_from_line(line)
+        if name:
+            return PuppetEntity(EntityKind.CLASS, name)
+        name = puppet_node_from_line(line)
+        if name:
+            return PuppetEntity(EntityKind.NODE, name)
+    return puppet_entity_from_context(hunk.header_ctx)
+
+
+def _gather_signals(diff: DiffResult, trace: Trace) -> EntitySignals:
+    """Extract Puppet entity names from a parsed diff and apply source priority."""
+    # Per-hunk best signal: pre-change context lines are checked before the @@ header
+    # so each hunk contributes exactly one entity (or none), eliminating cross-hunk
+    # and cross-file contamination.
+    hunk_classes: list[str] = []
+    hunk_nodes: list[str] = []
+    hunk_pre_nodes: list[str] = []  # subset of hunk_nodes found in pre_change_lines
+    for hunk in diff.hunks:
+        entity = _hunk_entity(hunk)
+        if entity:
+            if entity.kind == EntityKind.CLASS and entity.name not in hunk_classes:
+                hunk_classes.append(entity.name)
+            elif entity.kind == EntityKind.NODE and entity.name not in hunk_nodes:
+                hunk_nodes.append(entity.name)
+                for line in hunk.pre_change_lines:
+                    if puppet_node_from_line(line) == entity.name:
+                        if entity.name not in hunk_pre_nodes:
+                            hunk_pre_nodes.append(entity.name)
+                        break
+
+    # From added/removed diff lines — class/define/node declarations being changed
+    line_classes_added: list[str] = []
+    line_nodes_added: list[str] = []
+    for diff_line in diff.added_lines:
+        name = puppet_entity_from_line(diff_line.content)
+        if name and name not in line_classes_added:
+            line_classes_added.append(name)
+        nname = puppet_node_from_line(diff_line.content)
+        if nname and nname not in line_nodes_added:
+            line_nodes_added.append(nname)
+
+    line_classes_removed: list[str] = []
+    line_nodes_removed: list[str] = []
+    for diff_line in diff.removed_lines:
+        name = puppet_entity_from_line(diff_line.content)
+        if name and name not in line_classes_removed:
+            line_classes_removed.append(name)
+        nname = puppet_node_from_line(diff_line.content)
+        if nname and nname not in line_nodes_removed:
+            line_nodes_removed.append(nname)
+
+    all_class_candidates = first_nonempty(line_classes_added, line_classes_removed, hunk_classes)
+
+    # Deleted node declarations (line_nodes_removed) and nodes whose content was edited
+    # (hunk_pre_nodes, found in pre-change context lines) are equally strong signals and
+    # must be combined. Shadowing one with the other causes multi-node edits to look
+    # single-scoped. Fall back to header-only hunk signals when no strong signal exists.
+    strong_nodes = list(dict.fromkeys(line_nodes_added + line_nodes_removed + hunk_pre_nodes))
+    all_node_candidates = strong_nodes if strong_nodes else hunk_nodes
+
+    node_source = (
+        'line_added' if line_nodes_added else
+        'line_removed+hunk_pre' if (line_nodes_removed and hunk_pre_nodes) else
+        'line_removed' if line_nodes_removed else
+        'hunk_pre' if hunk_pre_nodes else
+        'hunk' if hunk_nodes else
+        'none'
+    )
+
+    trace.signals = TraceSignals(
+        files=diff.files,
+        class_added=line_classes_added,
+        class_removed=line_classes_removed,
+        class_hunk=hunk_classes,
+        class_candidates=all_class_candidates,
+        class_source=('line_added' if line_classes_added else
+                      'line_removed' if line_classes_removed else
+                      'hunk' if hunk_classes else 'none'),
+        node_added=line_nodes_added,
+        node_removed=line_nodes_removed,
+        node_hunk=hunk_nodes,
+        node_hunk_pre=hunk_pre_nodes,
+        node_candidates=all_node_candidates,
+        node_source=node_source,
+    )
+
+    return EntitySignals(all_class_candidates, all_node_candidates, hunk_classes)
+
+
+def determine_scope(diff_text: str, trace: Trace) -> str | None:
+    diff = parse_diff(diff_text)
+
+    if not diff.files:
+        trace.steps.append(TraceStep('no_files', Outcome.NO_RESULT))
+        return None
+
+    signals = _gather_signals(diff, trace)
+
+    # ── Single-file cases ─────────────────────────────────────────────────
+    if len(diff.files) == 1:
+        filepath = diff.files[0]
+
+        if not filepath.endswith('.pp'):
+            scope = path_to_scope(filepath)
+            trace.steps.append(TraceStep('single_nonpp_path', Outcome.CHOSEN, scope,
+                                         TraceStepDetails(file=filepath)))
+            return scope
+
+        trace.steps.append(TraceStep('branch', Outcome.INFO,
+                                     details=TraceStepDetails(branch='single_file_pp',
+                                                              file=filepath)))
+
+        # Puppet manifest: prefer extracted entity, fall back to path
+        if signals.all_class_candidates:
+            scope = max(signals.all_class_candidates, key=specificity)
+            trace.steps.append(TraceStep('single_pp_class', Outcome.CHOSEN, scope,
+                                         TraceStepDetails(candidates=signals.all_class_candidates)))
+            return scope
+
+        trace.steps.append(TraceStep('single_pp_class', Outcome.SKIPPED,
+                                     details=TraceStepDetails(reason='no class candidates')))
+
+        if signals.all_node_candidates:
+            if len(signals.all_node_candidates) == 1:
+                scope = signals.all_node_candidates[0]
+                trace.steps.append(TraceStep('single_pp_node', Outcome.CHOSEN, scope))
+                return scope
+            trace.steps.append(TraceStep('single_pp_node', Outcome.NO_RESULT,
+                                         details=TraceStepDetails(
+                                             reason='multiple node candidates',
+                                             candidates=signals.all_node_candidates)))
+        else:
+            trace.steps.append(TraceStep('single_pp_node', Outcome.SKIPPED,
+                                         details=TraceStepDetails(reason='no node candidates')))
+
+        # manifests/site.pp with no identifiable node → give up
+        if filepath == 'manifests/site.pp':
+            trace.steps.append(TraceStep('site_pp_bail', Outcome.NO_RESULT,
+                                         details=TraceStepDetails(
+                                             reason='site.pp with no identifiable node or class')))
+            return None
+
+        # Derive class name from manifest path as last resort
+        mscope = manifest_path_to_scope(filepath)
+        if mscope:
+            trace.steps.append(TraceStep('single_pp_manifest_path', Outcome.CHOSEN, mscope,
+                                         TraceStepDetails(file=filepath)))
+            return mscope
+
+        trace.steps.append(TraceStep('single_pp_manifest_path', Outcome.NO_RESULT,
+                                     details=TraceStepDetails(
+                                         reason='path does not match module manifest pattern',
+                                         file=filepath)))
+
+        scope = path_to_scope(filepath)
+        trace.steps.append(TraceStep('single_pp_path_fallback', Outcome.CHOSEN, scope,
+                                     TraceStepDetails(file=filepath)))
+        return scope
+
+    # ── Multi-file cases ──────────────────────────────────────────────────
+    pp_files = [f for f in diff.files if f.endswith('.pp')]
+    non_pp_files = [f for f in diff.files if not f.endswith('.pp')]
+
+    trace.steps.append(TraceStep('branch', Outcome.INFO,
+                                 details=TraceStepDetails(branch='multi_file',
+                                                          pp_files=pp_files,
+                                                          non_pp_files=non_pp_files)))
+
+    if signals.all_class_candidates:
+        prefix = common_prefix(signals.all_class_candidates, '::')
+        if prefix:
+            trace.steps.append(TraceStep('multi_class_prefix', Outcome.CHOSEN, prefix,
+                                         TraceStepDetails(candidates=signals.all_class_candidates)))
+            return prefix
+        trace.steps.append(TraceStep('multi_class_prefix', Outcome.NO_RESULT,
+                                     details=TraceStepDetails(
+                                         reason='no common :: prefix',
+                                         candidates=signals.all_class_candidates)))
+    else:
+        trace.steps.append(TraceStep('multi_class_prefix', Outcome.SKIPPED,
+                                     details=TraceStepDetails(reason='no class candidates')))
+
+    # Single node across all hunks, possibly with other files
+    if signals.all_node_candidates and not signals.all_class_candidates:
+        if len(signals.all_node_candidates) == 1:
+            scope = signals.all_node_candidates[0]
+            trace.steps.append(TraceStep('multi_single_node', Outcome.CHOSEN, scope))
+            return scope
+        trace.steps.append(TraceStep('multi_single_node', Outcome.NO_RESULT,
+                                     details=TraceStepDetails(
+                                         reason='multiple node candidates',
+                                         candidates=signals.all_node_candidates)))
+    else:
+        trace.steps.append(TraceStep('multi_single_node', Outcome.SKIPPED,
+                                     details=TraceStepDetails(
+                                         reason='no node candidates or class candidates also present')))
+
+    # All non-.pp files live under the same module/files/ dir, and manifest
+    # belongs to the same module → use module-level class name from ctx
+    if non_pp_files and signals.hunk_classes:
+        modules_from_files = {_module_of(f) for f in non_pp_files} - {None}
+        modules_from_pp = {_module_of(f) for f in pp_files} - {None}
+        all_modules = modules_from_files | modules_from_pp
+        if len(all_modules) == 1:
+            prefix = common_prefix(signals.hunk_classes, '::')
+            trace.steps.append(TraceStep('multi_module_match', Outcome.CHOSEN, prefix,
+                                         TraceStepDetails(module=next(iter(all_modules)),
+                                                          hunk_classes=signals.hunk_classes)))
+            return prefix or None
+        trace.steps.append(TraceStep('multi_module_match', Outcome.NO_RESULT,
+                                     details=TraceStepDetails(
+                                         reason='files span multiple modules',
+                                         modules=sorted(all_modules))))
+    else:
+        trace.steps.append(TraceStep('multi_module_match', Outcome.SKIPPED,
+                                     details=TraceStepDetails(
+                                         reason='no non-pp files or no hunk classes')))
+
+    # Fallback: non-PP files with no Puppet entity context — derive scope from paths
+    if non_pp_files:
+        scoped = [path_to_scope(f) for f in non_pp_files]
+        prefix = common_prefix(scoped, '/')
+        if prefix:
+            trace.steps.append(TraceStep('multi_nonpp_path_prefix', Outcome.CHOSEN, prefix,
+                                         TraceStepDetails(scoped=scoped)))
+            return prefix
+        trace.steps.append(TraceStep('multi_nonpp_path_prefix', Outcome.NO_RESULT,
+                                     details=TraceStepDetails(reason='no common / prefix',
+                                                              scoped=scoped)))
+    else:
+        trace.steps.append(TraceStep('multi_nonpp_path_prefix', Outcome.SKIPPED,
+                                     details=TraceStepDetails(reason='no non-pp files')))
+
+    trace.steps.append(TraceStep('exhausted', Outcome.NO_RESULT,
+                                 details=TraceStepDetails(reason='all heuristics failed')))
+    return None
+
+
+def _to_json(obj: Any) -> Any:
+    """Convert dataclasses to dicts recursively, omitting None-valued fields."""
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {f.name: _to_json(getattr(obj, f.name))
+                for f in dataclasses.fields(obj)
+                if getattr(obj, f.name) is not None}
+    if isinstance(obj, list):
+        return [_to_json(v) for v in obj]
+    return obj
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            'Git prepare-commit-msg hook: prepends a scope prefix to the commit\n'
+            'message based on the staged diff.\n'
+            '\n'
+            'When called without arguments (testing mode), reads a git diff from\n'
+            'stdin and writes the scope prefix to stdout, or exits with status 1\n'
+            'if the scope cannot be determined.'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '--install',
+        action='store_true',
+        help='Install this script as .git/hooks/prepare-commit-msg (cwd must be inside the same repository).',
+    )
+    parser.add_argument(
+        'commit_msg_file', nargs='?',
+        help='path to the commit message file (supplied by git)',
+    )
+    parser.add_argument(
+        'source', nargs='?',
+        help="commit source as supplied by git: 'message' (-m), 'template',\n"
+             "'merge', 'squash', or 'commit' (--amend); absent on plain commits",
+    )
+    parser.add_argument(
+        'sha', nargs='?',
+        help='SHA of the commit being amended (supplied by git for --amend)',
+    )
+    args = parser.parse_args()
+
+    if args.install:
+        script = Path(__file__).resolve()
+        r = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                           capture_output=True, text=True, cwd=script.parent)
+        if r.returncode != 0:
+            sys.exit('prepare-commit-msg --install: script is not inside a git repository')
+        script_repo = Path(r.stdout.strip()).resolve()
+        try:
+            Path.cwd().relative_to(script_repo)
+        except ValueError:
+            sys.exit(f'prepare-commit-msg --install: cwd is not inside the script\'s repository ({script_repo})')
+        hooks_dir = script_repo / '.git' / 'hooks'
+        hook = hooks_dir / 'prepare-commit-msg'
+        rel_target = Path(os.path.relpath(script, hooks_dir))
+        if hook.exists() or hook.is_symlink():
+            if hook.is_symlink() and hook.resolve() == script:
+                print(f'Already installed: {hook} -> {os.readlink(hook)}')
+                return
+            if hook.is_symlink():
+                desc = f'symlink to {os.readlink(hook)}'
+            else:
+                desc = 'a regular file'
+            answer = input(f'{hook} exists ({desc}). Overwrite? [y/N] ')
+            if answer.strip().lower() != 'y':
+                sys.exit('Aborted.')
+            hook.unlink()
+        hook.symlink_to(rel_target)
+        print(f'Installed: {hook} -> {rel_target}')
+        return
+
+    if args.commit_msg_file:
+        # Hook mode: invoked by git as prepare-commit-msg.
+        if args.source and args.source != 'template':
+            # Skip amend, merge, squash, and -m commits to avoid double-prefixing.
+            return
+        try:
+            result = subprocess.run(
+                ['git', '-c', 'core.pager=', 'diff', '--cached'],
+                capture_output=True, text=True, encoding='utf-8',
+            )
+            scope = determine_scope(result.stdout, Trace())
+            if scope:
+                with open(args.commit_msg_file, 'r', encoding='utf-8') as fh:
+                    existing = fh.read()
+                with open(args.commit_msg_file, 'w', encoding='utf-8') as fh:
+                    fh.write(f'{scope} --- \n' + existing)
+        except Exception as exc:
+            print(f'prepare-commit-msg: {exc}', file=sys.stderr)
+            # Do not abort the commit — exit 0 implicitly.
+    else:
+        # Testing mode: read diff from stdin, print scope prefix to stdout,
+        # and write a decision trace to stderr for debugging/testing.
+        diff_text = sys.stdin.read()
+        trace = Trace()
+        scope = determine_scope(diff_text, trace)
+        trace.scope = scope
+        print(json.dumps(_to_json(trace), indent=2), file=sys.stderr)
+        if scope:
+            print(f'{scope} --- ')
+        else:
+            print('Failed to determine context')
+            sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
