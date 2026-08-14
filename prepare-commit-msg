@@ -17,6 +17,14 @@ Hook mode (called by git):
 Testing mode (no arguments):
     Reads a git diff from stdin, writes the scope prefix to stdout.
     Exits with status 1 if the scope cannot be determined.
+
+By default, the module directories used to recognize scopes are read from an
+environment.conf found one directory above this script's parent (i.e. two
+levels above the script file itself). This can be overridden with the
+PREPARE_COMMIT_MSG_ENVIRONMENT_CONF environment variable or the
+--environment-conf flag (the flag just sets the environment variable), for
+running against an environment.conf elsewhere — e.g. in tests, or when this
+script is deployed at a location that doesn't fit the default layout.
 """
 
 import argparse
@@ -86,10 +94,17 @@ class Trace:
     scope: str | None = None
 
 
-@functools.lru_cache(maxsize=1)
-def _load_module_dirs() -> frozenset[str]:
-    conf = Path(__file__).resolve().parent.parent / 'environment.conf'
-    for line in conf.read_text(encoding='utf-8').splitlines():
+def _resolve_environment_conf() -> Path:
+    """Path to the environment.conf to read module directories from."""
+    override = os.environ.get('PREPARE_COMMIT_MSG_ENVIRONMENT_CONF')
+    return Path(override) if override else (
+        Path(__file__).resolve().parent.parent / 'environment.conf'
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _load_module_dirs(conf_path: Path) -> frozenset[str]:
+    for line in conf_path.read_text(encoding='utf-8').splitlines():
         key, _, value = line.partition('=')
         if key.strip() == 'modulepath':
             return frozenset(
@@ -97,12 +112,16 @@ def _load_module_dirs() -> frozenset[str]:
                 for entry in value.split(':')
                 if entry.strip() and not entry.strip().startswith('$')
             )
-    raise ValueError(f'modulepath not found in {conf}')
+    raise ValueError(f'modulepath not found in {conf_path}')
 
 
-@functools.lru_cache(maxsize=1)
-def _module_re() -> str:
-    return '(?:' + '|'.join(sorted(_load_module_dirs())) + ')'
+@functools.lru_cache(maxsize=None)
+def _module_re(module_dirs: frozenset[str]) -> str:
+    return '(?:' + '|'.join(sorted(module_dirs)) + ')'
+
+
+def _current_module_re() -> str:
+    return _module_re(_load_module_dirs(_resolve_environment_conf()))
 
 
 class HunkInfo(NamedTuple):
@@ -226,7 +245,7 @@ def puppet_node_from_line(line: str) -> str | None:
 def path_to_scope(filepath: str) -> str:
     """Convert a non-manifest file path to a scope string."""
     # <module-type-dir>/<module>/{files,templates}/[subdirs/]<filename>
-    m = re.match(rf'^{_module_re()}/([^/]+)/(?:files|templates)/(.+)$', filepath)
+    m = re.match(rf'^{_current_module_re()}/([^/]+)/(?:files|templates)/(.+)$', filepath)
     if m:
         basename = m.group(2).rsplit('/', 1)[-1]
         return f'{m.group(1)}/{basename}'
@@ -268,10 +287,10 @@ def specificity(name: str) -> int:
 
 def manifest_path_to_scope(filepath: str) -> str | None:
     """Derive Puppet class name from a manifest file path as a last resort."""
-    m = re.match(rf'^{_module_re()}/([^/]+)/manifests/init\.pp$', filepath)
+    m = re.match(rf'^{_current_module_re()}/([^/]+)/manifests/init\.pp$', filepath)
     if m:
         return m.group(1)
-    m = re.match(rf'^{_module_re()}/([^/]+)/manifests/([^/]+)\.pp$', filepath)
+    m = re.match(rf'^{_current_module_re()}/([^/]+)/manifests/([^/]+)\.pp$', filepath)
     if m:
         return f'{m.group(1)}::{m.group(2)}'
     return None
@@ -279,7 +298,7 @@ def manifest_path_to_scope(filepath: str) -> str | None:
 
 def _module_of(filepath: str) -> str | None:
     """Return the module name for a path under a module dir, or None."""
-    m = re.match(rf'^{_module_re()}/([^/]+)/', filepath)
+    m = re.match(rf'^{_current_module_re()}/([^/]+)/', filepath)
     return m.group(1) if m else None
 
 
@@ -563,6 +582,13 @@ def main() -> None:
         help='Install this script as .git/hooks/prepare-commit-msg (cwd must be inside the same repository).',
     )
     parser.add_argument(
+        '--environment-conf',
+        help='Path to the environment.conf to read module directories from, overriding the '
+             'default location (two levels above this script). Equivalent to setting '
+             'PREPARE_COMMIT_MSG_ENVIRONMENT_CONF; only useful in testing mode, since git '
+             'invokes hook mode with a fixed set of positional arguments.',
+    )
+    parser.add_argument(
         'commit_msg_file', nargs='?',
         help='path to the commit message file (supplied by git)',
     )
@@ -577,10 +603,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.environment_conf:
+        os.environ['PREPARE_COMMIT_MSG_ENVIRONMENT_CONF'] = args.environment_conf
+
     if args.install:
         script = Path(__file__).resolve()
         r = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
-                           capture_output=True, text=True, cwd=script.parent)
+                           capture_output=True, text=True, cwd=script.parent, check=False)
         if r.returncode != 0:
             sys.exit('prepare-commit-msg --install: script is not inside a git repository')
         script_repo = Path(r.stdout.strip()).resolve()
@@ -615,7 +644,7 @@ def main() -> None:
         try:
             result = subprocess.run(
                 ['git', '-c', 'core.pager=', 'diff', '--cached'],
-                capture_output=True, text=True, encoding='utf-8',
+                capture_output=True, text=True, encoding='utf-8', check=False,
             )
             scope = determine_scope(result.stdout, Trace())
             if scope:
@@ -623,7 +652,7 @@ def main() -> None:
                     existing = fh.read()
                 with open(args.commit_msg_file, 'w', encoding='utf-8') as fh:
                     fh.write(f'{scope} --- \n' + existing)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 -- must never block the commit
             print(f'prepare-commit-msg: {exc}', file=sys.stderr)
             # Do not abort the commit — exit 0 implicitly.
     else:

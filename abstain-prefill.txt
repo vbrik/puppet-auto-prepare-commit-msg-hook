@@ -1,0 +1,11 @@
+# One commit SHA per line. Blank lines and lines starting with # are ignored.
+# For each SHA, prepare-commit-msg's determine_scope() must return None,
+# regardless of whatever subject that commit actually has.
+# Resolved against the repo at --repo-path / PREPARE_COMMIT_MSG_TEST_REPO --
+# these SHAs must remain reachable there (not gc'd, rebased away, etc.) for
+# the suite to run.
+#
+# A trailing "# xfail: <reason>" on a sha line marks a known, accepted
+# heuristic gap rather than a live regression (strict xfail: turns into a
+# hard failure again once the heuristic actually gets fixed).
+f210d2479d2e1c9ab95e0f0d0b2a3ce8c46d1732  # xfail: multi-concern commit (doc tweak, new experimental module, site.pp node change); hook picks "modulejail" via multi_class_prefix instead of abstaining

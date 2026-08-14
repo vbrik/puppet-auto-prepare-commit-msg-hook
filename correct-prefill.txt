@@ -1,0 +1,7 @@
+# One commit SHA per line. Blank lines and lines starting with # are ignored.
+# For each SHA, prepare-commit-msg's determine_scope() must reproduce the
+# scope that commit's own real subject already carries before " --- ".
+# Resolved against the repo at --repo-path / PREPARE_COMMIT_MSG_TEST_REPO --
+# these SHAs must remain reachable there (not gc'd, rebased away, etc.) for
+# the suite to run.
+4f4d495e5abddf9d1daf718da07d1173b3e19d82
