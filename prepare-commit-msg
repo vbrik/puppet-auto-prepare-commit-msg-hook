@@ -43,10 +43,10 @@ DOMAIN_SUFFIX = '.icecube.wisc.edu'
 
 
 class Outcome(str, enum.Enum):
-    CHOSEN    = 'chosen'
-    SKIPPED   = 'skipped'
+    CHOSEN = 'chosen'
+    SKIPPED = 'skipped'
     NO_RESULT = 'no_result'
-    INFO      = 'info'
+    INFO = 'info'
 
 
 @dataclasses.dataclass
@@ -97,12 +97,14 @@ class Trace:
 def _resolve_environment_conf() -> Path:
     """Path to the environment.conf to read module directories from."""
     override = os.environ.get('PREPARE_COMMIT_MSG_ENVIRONMENT_CONF')
-    return Path(override) if override else (
-        Path(__file__).resolve().parent.parent / 'environment.conf'
+    return (
+        Path(override)
+        if override
+        else (Path(__file__).resolve().parent.parent / 'environment.conf')
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _load_module_dirs(conf_path: Path) -> frozenset[str]:
     for line in conf_path.read_text(encoding='utf-8').splitlines():
         key, _, value = line.partition('=')
@@ -115,7 +117,7 @@ def _load_module_dirs(conf_path: Path) -> frozenset[str]:
     raise ValueError(f'modulepath not found in {conf_path}')
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _module_re(module_dirs: frozenset[str]) -> str:
     return '(?:' + '|'.join(sorted(module_dirs)) + ')'
 
@@ -126,7 +128,7 @@ def _current_module_re() -> str:
 
 class HunkInfo(NamedTuple):
     filepath: str
-    header_ctx: str          # text after @@ ... @@ on the hunk header line
+    header_ctx: str  # text after @@ ... @@ on the hunk header line
     pre_change_lines: list[str]  # context lines before the first +/- in this hunk
 
 
@@ -180,7 +182,7 @@ def parse_diff(text: str) -> DiffResult:
 
 class EntityKind(str, enum.Enum):
     CLASS = 'class'
-    NODE  = 'node'
+    NODE = 'node'
 
 
 class PuppetEntity(NamedTuple):
@@ -245,7 +247,9 @@ def puppet_node_from_line(line: str) -> str | None:
 def path_to_scope(filepath: str) -> str:
     """Convert a non-manifest file path to a scope string."""
     # <module-type-dir>/<module>/{files,templates}/[subdirs/]<filename>
-    m = re.match(rf'^{_current_module_re()}/([^/]+)/(?:files|templates)/(.+)$', filepath)
+    m = re.match(
+        rf'^{_current_module_re()}/([^/]+)/(?:files|templates)/(.+)$', filepath
+    )
     if m:
         basename = m.group(2).rsplit('/', 1)[-1]
         return f'{m.group(1)}/{basename}'
@@ -304,8 +308,8 @@ def _module_of(filepath: str) -> str | None:
 
 class EntitySignals(NamedTuple):
     all_class_candidates: list[str]  # first non-empty source wins; others suppressed
-    all_node_candidates: list[str]   # same shadowing priority
-    hunk_classes: list[str]          # best per-hunk class signal, for module cross-check
+    all_node_candidates: list[str]  # same shadowing priority
+    hunk_classes: list[str]  # best per-hunk class signal, for module cross-check
 
 
 def _hunk_entity(hunk: HunkInfo) -> PuppetEntity | None:
@@ -366,22 +370,31 @@ def _gather_signals(diff: DiffResult, trace: Trace) -> EntitySignals:
         if nname and nname not in line_nodes_removed:
             line_nodes_removed.append(nname)
 
-    all_class_candidates = first_nonempty(line_classes_added, line_classes_removed, hunk_classes)
+    all_class_candidates = first_nonempty(
+        line_classes_added, line_classes_removed, hunk_classes
+    )
 
     # Deleted node declarations (line_nodes_removed) and nodes whose content was edited
     # (hunk_pre_nodes, found in pre-change context lines) are equally strong signals and
     # must be combined. Shadowing one with the other causes multi-node edits to look
     # single-scoped. Fall back to header-only hunk signals when no strong signal exists.
-    strong_nodes = list(dict.fromkeys(line_nodes_added + line_nodes_removed + hunk_pre_nodes))
+    strong_nodes = list(
+        dict.fromkeys(line_nodes_added + line_nodes_removed + hunk_pre_nodes)
+    )
     all_node_candidates = strong_nodes if strong_nodes else hunk_nodes
 
     node_source = (
-        'line_added' if line_nodes_added else
-        'line_removed+hunk_pre' if (line_nodes_removed and hunk_pre_nodes) else
-        'line_removed' if line_nodes_removed else
-        'hunk_pre' if hunk_pre_nodes else
-        'hunk' if hunk_nodes else
-        'none'
+        'line_added'
+        if line_nodes_added
+        else 'line_removed+hunk_pre'
+        if (line_nodes_removed and hunk_pre_nodes)
+        else 'line_removed'
+        if line_nodes_removed
+        else 'hunk_pre'
+        if hunk_pre_nodes
+        else 'hunk'
+        if hunk_nodes
+        else 'none'
     )
 
     trace.signals = TraceSignals(
@@ -390,9 +403,15 @@ def _gather_signals(diff: DiffResult, trace: Trace) -> EntitySignals:
         class_removed=line_classes_removed,
         class_hunk=hunk_classes,
         class_candidates=all_class_candidates,
-        class_source=('line_added' if line_classes_added else
-                      'line_removed' if line_classes_removed else
-                      'hunk' if hunk_classes else 'none'),
+        class_source=(
+            'line_added'
+            if line_classes_added
+            else 'line_removed'
+            if line_classes_removed
+            else 'hunk'
+            if hunk_classes
+            else 'none'
+        ),
         node_added=line_nodes_added,
         node_removed=line_nodes_removed,
         node_hunk=hunk_nodes,
@@ -419,83 +438,160 @@ def determine_scope(diff_text: str, trace: Trace) -> str | None:
 
         if not filepath.endswith('.pp'):
             scope = path_to_scope(filepath)
-            trace.steps.append(TraceStep('single_nonpp_path', Outcome.CHOSEN, scope,
-                                         TraceStepDetails(file=filepath)))
+            trace.steps.append(
+                TraceStep(
+                    'single_nonpp_path',
+                    Outcome.CHOSEN,
+                    scope,
+                    TraceStepDetails(file=filepath),
+                )
+            )
             return scope
 
-        trace.steps.append(TraceStep('branch', Outcome.INFO,
-                                     details=TraceStepDetails(branch='single_file_pp',
-                                                              file=filepath)))
+        trace.steps.append(
+            TraceStep(
+                'branch',
+                Outcome.INFO,
+                details=TraceStepDetails(branch='single_file_pp', file=filepath),
+            )
+        )
 
         # Puppet manifest: prefer extracted entity, fall back to path
         if signals.all_class_candidates:
             scope = max(signals.all_class_candidates, key=specificity)
-            trace.steps.append(TraceStep('single_pp_class', Outcome.CHOSEN, scope,
-                                         TraceStepDetails(candidates=signals.all_class_candidates)))
+            trace.steps.append(
+                TraceStep(
+                    'single_pp_class',
+                    Outcome.CHOSEN,
+                    scope,
+                    TraceStepDetails(candidates=signals.all_class_candidates),
+                )
+            )
             return scope
 
-        trace.steps.append(TraceStep('single_pp_class', Outcome.SKIPPED,
-                                     details=TraceStepDetails(reason='no class candidates')))
+        trace.steps.append(
+            TraceStep(
+                'single_pp_class',
+                Outcome.SKIPPED,
+                details=TraceStepDetails(reason='no class candidates'),
+            )
+        )
 
         if signals.all_node_candidates:
             if len(signals.all_node_candidates) == 1:
                 scope = signals.all_node_candidates[0]
                 trace.steps.append(TraceStep('single_pp_node', Outcome.CHOSEN, scope))
                 return scope
-            trace.steps.append(TraceStep('single_pp_node', Outcome.NO_RESULT,
-                                         details=TraceStepDetails(
-                                             reason='multiple node candidates',
-                                             candidates=signals.all_node_candidates)))
+            trace.steps.append(
+                TraceStep(
+                    'single_pp_node',
+                    Outcome.NO_RESULT,
+                    details=TraceStepDetails(
+                        reason='multiple node candidates',
+                        candidates=signals.all_node_candidates,
+                    ),
+                )
+            )
         else:
-            trace.steps.append(TraceStep('single_pp_node', Outcome.SKIPPED,
-                                         details=TraceStepDetails(reason='no node candidates')))
+            trace.steps.append(
+                TraceStep(
+                    'single_pp_node',
+                    Outcome.SKIPPED,
+                    details=TraceStepDetails(reason='no node candidates'),
+                )
+            )
 
         # manifests/site.pp with no identifiable node → give up
         if filepath == 'manifests/site.pp':
-            trace.steps.append(TraceStep('site_pp_bail', Outcome.NO_RESULT,
-                                         details=TraceStepDetails(
-                                             reason='site.pp with no identifiable node or class')))
+            trace.steps.append(
+                TraceStep(
+                    'site_pp_bail',
+                    Outcome.NO_RESULT,
+                    details=TraceStepDetails(
+                        reason='site.pp with no identifiable node or class'
+                    ),
+                )
+            )
             return None
 
         # Derive class name from manifest path as last resort
         mscope = manifest_path_to_scope(filepath)
         if mscope:
-            trace.steps.append(TraceStep('single_pp_manifest_path', Outcome.CHOSEN, mscope,
-                                         TraceStepDetails(file=filepath)))
+            trace.steps.append(
+                TraceStep(
+                    'single_pp_manifest_path',
+                    Outcome.CHOSEN,
+                    mscope,
+                    TraceStepDetails(file=filepath),
+                )
+            )
             return mscope
 
-        trace.steps.append(TraceStep('single_pp_manifest_path', Outcome.NO_RESULT,
-                                     details=TraceStepDetails(
-                                         reason='path does not match module manifest pattern',
-                                         file=filepath)))
+        trace.steps.append(
+            TraceStep(
+                'single_pp_manifest_path',
+                Outcome.NO_RESULT,
+                details=TraceStepDetails(
+                    reason='path does not match module manifest pattern', file=filepath
+                ),
+            )
+        )
 
         scope = path_to_scope(filepath)
-        trace.steps.append(TraceStep('single_pp_path_fallback', Outcome.CHOSEN, scope,
-                                     TraceStepDetails(file=filepath)))
+        trace.steps.append(
+            TraceStep(
+                'single_pp_path_fallback',
+                Outcome.CHOSEN,
+                scope,
+                TraceStepDetails(file=filepath),
+            )
+        )
         return scope
 
     # ── Multi-file cases ──────────────────────────────────────────────────
     pp_files = [f for f in diff.files if f.endswith('.pp')]
     non_pp_files = [f for f in diff.files if not f.endswith('.pp')]
 
-    trace.steps.append(TraceStep('branch', Outcome.INFO,
-                                 details=TraceStepDetails(branch='multi_file',
-                                                          pp_files=pp_files,
-                                                          non_pp_files=non_pp_files)))
+    trace.steps.append(
+        TraceStep(
+            'branch',
+            Outcome.INFO,
+            details=TraceStepDetails(
+                branch='multi_file', pp_files=pp_files, non_pp_files=non_pp_files
+            ),
+        )
+    )
 
     if signals.all_class_candidates:
         prefix = common_prefix(signals.all_class_candidates, '::')
         if prefix:
-            trace.steps.append(TraceStep('multi_class_prefix', Outcome.CHOSEN, prefix,
-                                         TraceStepDetails(candidates=signals.all_class_candidates)))
+            trace.steps.append(
+                TraceStep(
+                    'multi_class_prefix',
+                    Outcome.CHOSEN,
+                    prefix,
+                    TraceStepDetails(candidates=signals.all_class_candidates),
+                )
+            )
             return prefix
-        trace.steps.append(TraceStep('multi_class_prefix', Outcome.NO_RESULT,
-                                     details=TraceStepDetails(
-                                         reason='no common :: prefix',
-                                         candidates=signals.all_class_candidates)))
+        trace.steps.append(
+            TraceStep(
+                'multi_class_prefix',
+                Outcome.NO_RESULT,
+                details=TraceStepDetails(
+                    reason='no common :: prefix',
+                    candidates=signals.all_class_candidates,
+                ),
+            )
+        )
     else:
-        trace.steps.append(TraceStep('multi_class_prefix', Outcome.SKIPPED,
-                                     details=TraceStepDetails(reason='no class candidates')))
+        trace.steps.append(
+            TraceStep(
+                'multi_class_prefix',
+                Outcome.SKIPPED,
+                details=TraceStepDetails(reason='no class candidates'),
+            )
+        )
 
     # Single node across all hunks, possibly with other files
     if signals.all_node_candidates and not signals.all_class_candidates:
@@ -503,14 +599,26 @@ def determine_scope(diff_text: str, trace: Trace) -> str | None:
             scope = signals.all_node_candidates[0]
             trace.steps.append(TraceStep('multi_single_node', Outcome.CHOSEN, scope))
             return scope
-        trace.steps.append(TraceStep('multi_single_node', Outcome.NO_RESULT,
-                                     details=TraceStepDetails(
-                                         reason='multiple node candidates',
-                                         candidates=signals.all_node_candidates)))
+        trace.steps.append(
+            TraceStep(
+                'multi_single_node',
+                Outcome.NO_RESULT,
+                details=TraceStepDetails(
+                    reason='multiple node candidates',
+                    candidates=signals.all_node_candidates,
+                ),
+            )
+        )
     else:
-        trace.steps.append(TraceStep('multi_single_node', Outcome.SKIPPED,
-                                     details=TraceStepDetails(
-                                         reason='no node candidates or class candidates also present')))
+        trace.steps.append(
+            TraceStep(
+                'multi_single_node',
+                Outcome.SKIPPED,
+                details=TraceStepDetails(
+                    reason='no node candidates or class candidates also present'
+                ),
+            )
+        )
 
     # All non-.pp files live under the same module/files/ dir, and manifest
     # belongs to the same module → use module-level class name from ctx
@@ -520,45 +628,84 @@ def determine_scope(diff_text: str, trace: Trace) -> str | None:
         all_modules = modules_from_files | modules_from_pp
         if len(all_modules) == 1:
             prefix = common_prefix(signals.hunk_classes, '::')
-            trace.steps.append(TraceStep('multi_module_match', Outcome.CHOSEN, prefix,
-                                         TraceStepDetails(module=next(iter(all_modules)),
-                                                          hunk_classes=signals.hunk_classes)))
+            trace.steps.append(
+                TraceStep(
+                    'multi_module_match',
+                    Outcome.CHOSEN,
+                    prefix,
+                    TraceStepDetails(
+                        module=next(iter(all_modules)),
+                        hunk_classes=signals.hunk_classes,
+                    ),
+                )
+            )
             return prefix or None
-        trace.steps.append(TraceStep('multi_module_match', Outcome.NO_RESULT,
-                                     details=TraceStepDetails(
-                                         reason='files span multiple modules',
-                                         modules=sorted(all_modules))))
+        trace.steps.append(
+            TraceStep(
+                'multi_module_match',
+                Outcome.NO_RESULT,
+                details=TraceStepDetails(
+                    reason='files span multiple modules', modules=sorted(all_modules)
+                ),
+            )
+        )
     else:
-        trace.steps.append(TraceStep('multi_module_match', Outcome.SKIPPED,
-                                     details=TraceStepDetails(
-                                         reason='no non-pp files or no hunk classes')))
+        trace.steps.append(
+            TraceStep(
+                'multi_module_match',
+                Outcome.SKIPPED,
+                details=TraceStepDetails(reason='no non-pp files or no hunk classes'),
+            )
+        )
 
     # Fallback: non-PP files with no Puppet entity context — derive scope from paths
     if non_pp_files:
         scoped = [path_to_scope(f) for f in non_pp_files]
         prefix = common_prefix(scoped, '/')
         if prefix:
-            trace.steps.append(TraceStep('multi_nonpp_path_prefix', Outcome.CHOSEN, prefix,
-                                         TraceStepDetails(scoped=scoped)))
+            trace.steps.append(
+                TraceStep(
+                    'multi_nonpp_path_prefix',
+                    Outcome.CHOSEN,
+                    prefix,
+                    TraceStepDetails(scoped=scoped),
+                )
+            )
             return prefix
-        trace.steps.append(TraceStep('multi_nonpp_path_prefix', Outcome.NO_RESULT,
-                                     details=TraceStepDetails(reason='no common / prefix',
-                                                              scoped=scoped)))
+        trace.steps.append(
+            TraceStep(
+                'multi_nonpp_path_prefix',
+                Outcome.NO_RESULT,
+                details=TraceStepDetails(reason='no common / prefix', scoped=scoped),
+            )
+        )
     else:
-        trace.steps.append(TraceStep('multi_nonpp_path_prefix', Outcome.SKIPPED,
-                                     details=TraceStepDetails(reason='no non-pp files')))
+        trace.steps.append(
+            TraceStep(
+                'multi_nonpp_path_prefix',
+                Outcome.SKIPPED,
+                details=TraceStepDetails(reason='no non-pp files'),
+            )
+        )
 
-    trace.steps.append(TraceStep('exhausted', Outcome.NO_RESULT,
-                                 details=TraceStepDetails(reason='all heuristics failed')))
+    trace.steps.append(
+        TraceStep(
+            'exhausted',
+            Outcome.NO_RESULT,
+            details=TraceStepDetails(reason='all heuristics failed'),
+        )
+    )
     return None
 
 
 def _to_json(obj: Any) -> Any:
     """Convert dataclasses to dicts recursively, omitting None-valued fields."""
     if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return {f.name: _to_json(getattr(obj, f.name))
-                for f in dataclasses.fields(obj)
-                if getattr(obj, f.name) is not None}
+        return {
+            f.name: _to_json(getattr(obj, f.name))
+            for f in dataclasses.fields(obj)
+            if getattr(obj, f.name) is not None
+        }
     if isinstance(obj, list):
         return [_to_json(v) for v in obj]
     return obj
@@ -584,21 +731,24 @@ def main() -> None:
     parser.add_argument(
         '--environment-conf',
         help='Path to the environment.conf to read module directories from, overriding the '
-             'default location (two levels above this script). Equivalent to setting '
-             'PREPARE_COMMIT_MSG_ENVIRONMENT_CONF; only useful in testing mode, since git '
-             'invokes hook mode with a fixed set of positional arguments.',
+        'default location (two levels above this script). Equivalent to setting '
+        'PREPARE_COMMIT_MSG_ENVIRONMENT_CONF; only useful in testing mode, since git '
+        'invokes hook mode with a fixed set of positional arguments.',
     )
     parser.add_argument(
-        'commit_msg_file', nargs='?',
+        'commit_msg_file',
+        nargs='?',
         help='path to the commit message file (supplied by git)',
     )
     parser.add_argument(
-        'source', nargs='?',
+        'source',
+        nargs='?',
         help="commit source as supplied by git: 'message' (-m), 'template',\n"
-             "'merge', 'squash', or 'commit' (--amend); absent on plain commits",
+        "'merge', 'squash', or 'commit' (--amend); absent on plain commits",
     )
     parser.add_argument(
-        'sha', nargs='?',
+        'sha',
+        nargs='?',
         help='SHA of the commit being amended (supplied by git for --amend)',
     )
     args = parser.parse_args()
@@ -608,15 +758,24 @@ def main() -> None:
 
     if args.install:
         script = Path(__file__).resolve()
-        r = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
-                           capture_output=True, text=True, cwd=script.parent, check=False)
+        r = subprocess.run(
+            ['git', 'rev-parse', '--show-toplevel'],
+            capture_output=True,
+            text=True,
+            cwd=script.parent,
+            check=False,
+        )
         if r.returncode != 0:
-            sys.exit('prepare-commit-msg --install: script is not inside a git repository')
+            sys.exit(
+                'prepare-commit-msg --install: script is not inside a git repository'
+            )
         script_repo = Path(r.stdout.strip()).resolve()
         try:
             Path.cwd().relative_to(script_repo)
         except ValueError:
-            sys.exit(f'prepare-commit-msg --install: cwd is not inside the script\'s repository ({script_repo})')
+            sys.exit(
+                f"prepare-commit-msg --install: cwd is not inside the script's repository ({script_repo})"
+            )
         hooks_dir = script_repo / '.git' / 'hooks'
         hook = hooks_dir / 'prepare-commit-msg'
         rel_target = Path(os.path.relpath(script, hooks_dir))
@@ -644,7 +803,10 @@ def main() -> None:
         try:
             result = subprocess.run(
                 ['git', '-c', 'core.pager=', 'diff', '--cached'],
-                capture_output=True, text=True, encoding='utf-8', check=False,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                check=False,
             )
             scope = determine_scope(result.stdout, Trace())
             if scope:
