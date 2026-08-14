@@ -5,6 +5,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from conftest import HOOK_PATH, git_diff, git_subject
 
 
@@ -91,3 +92,30 @@ def test_default_environment_conf_path(hook, monkeypatch):
     monkeypatch.delenv('PREPARE_COMMIT_MSG_ENVIRONMENT_CONF', raising=False)
     expected = Path(hook.__file__).resolve().parent.parent / 'environment.conf'
     assert hook._resolve_environment_conf() == expected
+
+
+@pytest.mark.parametrize(
+    ('line', 'expected'),
+    [
+        # Quoted, fully-qualified -- domain dropped regardless of which one.
+        ("node 'foo.example.com' {", 'foo'),
+        ('node "foo.example.org" {', 'foo'),
+        # Quoted, bare hostname -- nothing to strip.
+        ("node 'foo' {", 'foo'),
+        # Bare-word (Puppet 3) syntax, both with and without a domain.
+        ('node foo.example.com {', 'foo'),
+        ('node foo {', 'foo'),
+        # Regex node names are left untouched (apart from anchor-stripping),
+        # dots and all -- they're patterns, not literal hostnames, so
+        # splitting on '.' would mangle the regex rather than strip a domain.
+        (
+            'node /^foo-\\d+\\.example\\.com$/ {',
+            'foo-\\d+\\.example\\.com',
+        ),
+        ('node /^foo-\\d+/ {', 'foo-\\d+'),
+        # Not a node declaration at all.
+        ('class foo {', None),
+    ],
+)
+def test_parse_node_name(hook, line, expected):
+    assert hook._parse_node_name(line) == expected

@@ -39,8 +39,6 @@ import sys
 from pathlib import Path
 from typing import Any, NamedTuple
 
-DOMAIN_SUFFIX = '.icecube.wisc.edu'
-
 
 class Outcome(str, enum.Enum):
     CHOSEN = 'chosen'
@@ -195,18 +193,28 @@ def _regex_node_name(pattern: str) -> str:
     return pattern.lstrip('^').rstrip('$')
 
 
+def _strip_domain(name: str) -> str:
+    """Drop a trailing domain from a literal (non-regex) node name.
+
+    Node names are hostnames, optionally fully-qualified; internal name
+    components use hyphens, not dots, so the first dot (if any) always marks
+    the start of the domain.
+    """
+    return name.split('.', 1)[0]
+
+
 def _parse_node_name(s: str) -> str | None:
     """Extract node name from a string that starts with 'node' (no leading whitespace)."""
     m = re.match(r"^node\s+['\"]([^'\"]+)['\"]", s)
     if m:
-        return m.group(1).replace(DOMAIN_SUFFIX, '')
+        return _strip_domain(m.group(1))
     m = re.match(r'^node\s+/([^/]+)/', s)
     if m:
         return _regex_node_name(m.group(1))
     # Bare-word node name — old Puppet 3 syntax; supported for testing on old diffs.
     m = re.match(r'^node\s+(\w[\w.-]*)[\s{]', s)
     if m:
-        return m.group(1).replace(DOMAIN_SUFFIX, '')
+        return _strip_domain(m.group(1))
     return None
 
 

@@ -1,3 +1,58 @@
+# puppet-auto-prepare-commit-msg-hook
+
+A git `prepare-commit-msg` hook that automatically prefixes commit subjects
+with a scope, following IceCube's Puppet repository convention of
+`<SCOPE> --- <subject>`. The scope -- a Puppet class name, node hostname, or
+file path -- is inferred from the staged diff, so contributors don't have to
+type it by hand and commit subjects stay consistent.
+
+## How it works
+
+The hook parses the staged diff and looks for Puppet `class`/`define`/`node`
+declarations in hunk headers, changed lines, and surrounding context. Files
+outside `manifests/` (e.g. under `files/`, `templates/`, `hiera/`,
+`hostfiles/`) are mapped to a scope based on their path instead. See the
+heuristic itself, `determine_scope()` in `prepare-commit-msg`, for the exact
+precedence rules. When no scope can be determined, the hook leaves the
+commit message untouched -- it never blocks or fails a commit.
+
+It's tailored to IceCube's Puppet layout (module directories read from
+`environment.conf`) but the diff-parsing logic, including domain stripping
+from fully-qualified node names, is layout-agnostic and can likely be
+adapted to other Puppet repos.
+
+## Installation
+
+From inside the target git repository:
+
+```bash
+/path/to/prepare-commit-msg --install
+```
+
+This symlinks the script to `.git/hooks/prepare-commit-msg`. It will prompt
+before overwriting an existing hook.
+
+By default, module directories are read from an `environment.conf` two
+levels above the script file (i.e. one directory above wherever the script's
+parent directory lives). Override this with `--environment-conf` or the
+`PREPARE_COMMIT_MSG_ENVIRONMENT_CONF` environment variable if that layout
+doesn't fit.
+
+## Usage
+
+Once installed, the hook runs automatically on `git commit` and prepends
+`<SCOPE> --- ` to the message. It's skipped for `--amend`, merges, squashes,
+and `-m` commits, to avoid double-prefixing.
+
+For debugging or scripting, run the script directly with no arguments to use
+testing mode: it reads a diff from stdin, writes the scope prefix to stdout
+(exiting 1 if none was found), and writes a JSON decision trace to stderr
+explaining which heuristic branch fired.
+
+```bash
+git diff --cached | ./prepare-commit-msg
+```
+
 ## Testing
 
 Regression tests replay a curated set of real commits through
@@ -38,3 +93,18 @@ pytest tests/ --repo-path /path/to/puppet/repo
 # or
 PREPARE_COMMIT_MSG_TEST_REPO=/path/to/puppet/repo pytest tests/
 ```
+
+## Development
+
+The script has no runtime dependencies beyond Python's standard library.
+`pytest` is required to run the test suite, and `ruff` is used for
+formatting and linting:
+
+```bash
+ruff format prepare-commit-msg tests/
+ruff check prepare-commit-msg tests/
+```
+
+## License
+
+MIT -- see [LICENSE](LICENSE).
