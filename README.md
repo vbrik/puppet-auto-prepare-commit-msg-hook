@@ -1,3 +1,28 @@
+## find-mismatched-subjects.py
+
+Dev helper that scans a repo's commit history (newest first, non-merge
+commits) and reports commits whose real subject doesn't start with the
+scope prefix `prepare-commit-msg` would have generated for them -- useful
+for spotting heuristic regressions or subjects that were written by hand.
+Stops once it's found the requested number of mismatches. For each
+mismatch, prints the scope the hook would have prefilled, then a
+`git show` of the commit, separated from the next mismatch by a divider
+line. All output goes to stdout.
+
+```bash
+./find-mismatched-subjects.py --repo-path /path/to/puppet/repo -n 10
+./find-mismatched-subjects.py --repo-path /path/to/puppet/repo -n 5 --author alice --author bob
+./find-mismatched-subjects.py --repo-path /path/to/puppet/repo -n 10 --skip-file triaged.txt
+```
+
+`--skip-file` takes a file of commit SHAs (one per line, `#` comments allowed,
+same format as the fixture lists below) to exclude from consideration --
+handy for commits already triaged as known, accepted mismatches.
+
+Commits whose diff contains a case-insensitive substring of "passw", "priv",
+"cert", or "secret" are never printed -- a skip notice is printed instead,
+since the diff itself might be sensitive.
+
 ## Testing
 
 Regression tests replay a curated set of real commits through
